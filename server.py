@@ -13,6 +13,7 @@ app = Flask(__name__)
 
 print("Available SAM models:", sam_model_registry.keys())
 
+# Setup SAM model and device
 MODEL_TYPE = "vit_b"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # CHECKPOINT = "checkpoints/sam_vit_h_4b8939.pth"
@@ -22,13 +23,13 @@ CHECKPOINT = "checkpoints/sam_vit_b_01ec64.pth"
 sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT)
 sam.to(DEVICE)
 
-# Use the automatic generator with more reasonable parameters to avoid OOM
+# 
 mask_generator = SamAutomaticMaskGenerator(
     model=sam,
-    points_per_side=48,            # Modest increase in density
-    pred_iou_thresh=0.8,           # Lower threshold to keep more masks
-    stability_score_thresh=0.8,    # Lower threshold
-    min_mask_region_area=100       # Filter out tiny noise
+    points_per_side=48,            
+    pred_iou_thresh=0.8,           
+    stability_score_thresh=0.8,    
+    min_mask_region_area=100       
 )
 
 
@@ -53,7 +54,7 @@ def upload():
     if fname == "":
         return jsonify({"error": "empty filename"}), 400
 
-    # --- check cache first ---
+
     cached = app.config.get("objects", {}).get(fname)
     if cached is not None:
         return jsonify({"objects": cached})
@@ -105,7 +106,8 @@ def upload():
 @app.route("/paint", methods=["POST"])
 def paint():
     """
-    JSON body: { "filename": "...", "object_id": 3, "color": "#ff0000" }
+    Expects JSON with fields: filename, object_id, color (hex string).
+    Returns the modified image with the specified object painted in the given color.
     """
     data = request.get_json(force=True)
     if not data:
@@ -147,6 +149,7 @@ def paint():
     return send_file(io.BytesIO(image_to_bytes(out)), mimetype="image/png")
 
 
+# Run the server
 if __name__ == "__main__":
     os.makedirs("uploads", exist_ok=True)
     app.run(port=5100, debug=True)
