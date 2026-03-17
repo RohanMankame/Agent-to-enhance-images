@@ -5,68 +5,69 @@ import io
 
 API_URL = "http://localhost:5100"
 
-st.title("Image Object Detecition tool")
+st.set_page_config(page_title="AI Image Enhancer", layout="wide")
+st.title("AI Object Labeler & Painter")
 
-uploaded = st.file_uploader("Choose an image", type=["jpg", "png"])
+uploaded = st.file_uploader("Upload an image...", type=["jpg", "png"])
+
 if uploaded:
-    # grab the raw bytes one time
+    col1, col2 = st.columns(2)
+    
     data = uploaded.getvalue()
     orig = Image.open(io.BytesIO(data))
-    st.image(orig, caption="original", width=600)
+    
+    with col1:
+        st.image(orig, caption="Original Image", use_container_width=True)
 
-    # now send a fresh BytesIO built from the bytes
+    # 1. Send to Backend
     files = {"file": (uploaded.name, io.BytesIO(data), uploaded.type)}
-    r = requests.post(f"{API_URL}/upload", files=files)
+    with st.spinner("Analyzing image with DINO + SAM 2..."):
+        r = requests.post(f"{API_URL}/upload", files=files)
 
-    st.write("upload status", r.status_code)
-    st.write("upload response", r.text)
-    if not r.ok:
-        st.error("upload request failed")
-    else:
-        data = r.json()
-        objects = data.get("objects", [])
-        st.write(f"{len(objects)} objects detected")
-
-        # Draw all bounding boxes on a preview image so user can see their IDs
-        all_preview = orig.copy()
-        draw_all = ImageDraw.Draw(all_preview)
-        for o in objects:
-            xmin, ymin, xmax, ymax = o["bbox"]
-            obj_id = str(o["id"])
-            draw_all.rectangle([xmin, ymin, xmax, ymax], outline="blue", width=2)
-            draw_all.text((xmin, ymin), obj_id, fill="red")
+    if r.ok:
+        res_data = r.json()
+        objects = res_data.get("objects", [])
         
-        st.image(all_preview, caption="All detected objects (with IDs)", width=600)
+        # 2. Draw Labels and Boxes for the Preview
+        preview_img = orig.copy()
+        draw = ImageDraw.Draw(preview_img)
+        
+        for o in objects:
+            box = o["bbox"] # [xmin, ymin, xmax, ymax]
+            label_text = f"{o['id']}: {o['label']}"
+            
+            # Draw Box
+            draw.rectangle(box, outline="lime", width=3)
+            # Draw Label Background
+            draw.rectangle([box[0], box[1] - 20, box[0] + 80, box[1]], fill="lime")
+            # Draw Label Text
+            draw.text((box[0] + 5, box[1] - 18), label_text, fill="black")
+            
+        with col2:
+            st.image(preview_img, caption="AI Detections", use_container_width=True)
 
-        choices = [
-            f"object {o['id']} (area={o['area']})" for o in objects
-        ]
-        selection = st.selectbox("pick an object", choices)
+        # 3. User Controls
+        st.divider()
+        # Dropdown now uses the LABELS!
+        choices = [f"{o['id']}: {o['label']} (Score: {o.get('score', 0):.2f})" for o in objects]
+        selection = st.selectbox("Pick an object to recolor:", choices)
+        
+        color = st.color_picker("Pick a brand new color:", "#FF0000")
 
-        if selection:
-            sel_id = int(selection.split()[1])
-            info = next(o for o in objects if o["id"] == sel_id)
-            xmin, ymin, xmax, ymax = info["bbox"]
-
-            preview = orig.copy()
-            draw = ImageDraw.Draw(preview)
-            draw.rectangle([xmin, ymin, xmax, ymax],
-                           outline="red", width=3)
-            st.image(preview, caption="selection preview", width=600)
-
-        color = st.color_picker("pick a colour", "#ff0000")
-        if st.button("paint"):
-            obj_id = int(selection.split()[1])
+        if st.button("✨ Paint Object"):
+            sel_id = int(selection.split(":")[0])
             payload = {
-                "filename": uploaded.name,
-                "object_id": obj_id,
-                "color": color,
+                "filename": uploaded.name, 
+                "object_id": sel_id, 
+                "color": color
             }
-            r2 = requests.post(f"{API_URL}/paint", json=payload)
-            #st.write("paint status", r2.status_code)
-            st.write("paint response", r2.text[:500])
+            
+            with st.spinner("Applying digital paint..."):
+                r2 = requests.post(f"{API_URL}/paint", json=payload)
+                
             if r2.ok:
-                img = Image.open(io.BytesIO(r2.content))
-                st.image(img, caption="modified", width=600)
+                st.image(io.BytesIO(r2.content), caption="Final Result", width=1000)
             else:
-                st.error("paint request failed")
+                st.error("Painting failed. Check backend logs.")
+    else:
+        st.error(f"Detection failed: {r.text}")

@@ -1,37 +1,36 @@
-# server.py
 import io
 import os
+import torch
+import numpy as np
 from flask import Flask, request, jsonify, send_file
 from PIL import Image
-import numpy as np
-import torch
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
-# Import SamAutomaticMaskGenerator instead of SamPredictor
-from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
+# Sam2 Checkpoints are avalable at 
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+except ImportError:
+    print("Error: sam2 library not found. Please install it from the official Meta SAM 2 repository.")
 
 app = Flask(__name__)
 
-print("Available SAM models:", sam_model_registry.keys())
-
-# Setup SAM model and device
-MODEL_TYPE = "vit_b"
+# --- CONFIGURATION ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# CHECKPOINT = "checkpoints/sam_vit_h_4b8939.pth"
-CHECKPOINT = "checkpoints/sam_vit_b_01ec64.pth"
+DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
+# Update these paths to where your weights are stored
+SAM2_CHECKPOINT = "checkpoints/sam2_hiera_tiny.pt"
+SAM2_CONFIG = "sam2_hiera_t.yaml" 
 
-# load once at startup
-sam = sam_model_registry[MODEL_TYPE](checkpoint=CHECKPOINT)
-sam.to(DEVICE)
+# --- MODEL INITIALIZATION ---
+print(f"Loading Grounding DINO ({DINO_MODEL_ID})...")
+dino_processor = AutoProcessor.from_pretrained(DINO_MODEL_ID)
+dino_model = AutoModelForZeroShotObjectDetection.from_pretrained(DINO_MODEL_ID).to(DEVICE)
 
-# 
-mask_generator = SamAutomaticMaskGenerator(
-    model=sam,
-    points_per_side=48,            
-    pred_iou_thresh=0.8,           
-    stability_score_thresh=0.8,    
-    min_mask_region_area=100       
-)
-
+print("Loading SAM 2...")
+sam2_model = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device=DEVICE)
+predictor = SAM2ImagePredictor(sam2_model)
 
 def image_to_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
@@ -39,117 +38,95 @@ def image_to_bytes(img: Image.Image) -> bytes:
     buf.seek(0)
     return buf.read()
 
-
 @app.route("/upload", methods=["POST"])
 def upload():
-    """
-    Expects form-data with 'file' field.
-    Returns a list of object masks with simple metadata.
-    """
     if "file" not in request.files:
         return jsonify({"error": "no file part"}), 400
 
     file = request.files["file"]
     fname = file.filename or "unnamed"
-    if fname == "":
-        return jsonify({"error": "empty filename"}), 400
+    
+    # Simple in-memory cache
+    if fname in app.config.get("objects", {}):
+        return jsonify({"objects": app.config["objects"][fname]})
 
-
-    cached = app.config.get("objects", {}).get(fname)
-    if cached is not None:
-        return jsonify({"objects": cached})
-
-    # Ensure uploads dir exists and save the original image
     os.makedirs("uploads", exist_ok=True)
     filepath = os.path.join("uploads", fname)
-    try:
-        img = Image.open(file.stream).convert("RGB")
-    except Exception as e:
-        return jsonify({"error": f"could not open image: {e}"}), 400
+    img = Image.open(file.stream).convert("RGB")
     img.save(filepath)
-
     np_img = np.array(img)
 
-    # Downscale to limit memory use
-    max_dim = 1024
-    if max(np_img.shape[:2]) > max_dim:
-        scale = max_dim / max(np_img.shape[:2])
-        img = img.resize((int(np_img.shape[1]*scale), int(np_img.shape[0]*scale)), Image.Resampling.LANCZOS)
-        np_img = np.array(img)
+    # 1. Grounding DINO - Detection & Labeling
+    # This prompt tells DINO what classes to look for
+    prompt = "all objects. person. chair. table. bottle. cup. computer. plant."
+    inputs = dino_processor(images=img, text=prompt, return_tensors="pt").to(DEVICE)
+    
+    with torch.no_grad():
+        outputs = dino_model(**inputs)
+    
+    results = dino_processor.post_process_grounded_object_detection(
+        outputs, 
+        inputs.input_ids, 
+        threshold=0.35, 
+        target_sizes=[img.size[::-1]]
+    )[0]
 
-    try:
-        masks = mask_generator.generate(np_img)
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"mask generation failed: {exc}"}), 500
+    if len(results["boxes"]) == 0:
+        return jsonify({"objects": [], "message": "No objects found"})
+
+    # 2. SAM 2 - Precise Segmentation
+    predictor.set_image(np_img)
+    boxes = results["boxes"].cpu().numpy()
+    
+    # SAM 2 can predict masks from multiple boxes at once
+    masks, scores, _ = predictor.predict(
+        box=boxes,
+        multimask_output=False
+    )
 
     objects = []
     session_masks = []
-    for i, mask_data in enumerate(masks):
-        seg = mask_data.get("segmentation")
-        if seg is None:
-            continue
-        session_masks.append(seg)
-        x, y, w, h = mask_data.get("bbox", (0, 0, 0, 0))
-        bbox = [int(x), int(y), int(x + w), int(y + h)]
-        area = int(mask_data.get("area", 0))
-        objects.append({"id": i, "bbox": bbox, "area": area})
+    
+    # 3. Format Response
+    for i, (mask, box, label, score) in enumerate(zip(masks, boxes, results["labels"], results["scores"])):
+        # mask is [1, H, W], we want [H, W]
+        binary_mask = mask[0] > 0.5 
+        session_masks.append(binary_mask)
+        
+        objects.append({
+            "id": i,
+            "label": label,
+            "bbox": [int(x) for x in box],
+            "area": int(binary_mask.sum()),
+            "score": round(float(score), 3)
+        })
 
-    # cache both metadata and masks
     app.config.setdefault("objects", {})[fname] = objects
     app.config.setdefault("masks", {})[fname] = session_masks
 
     return jsonify({"objects": objects})
 
-
 @app.route("/paint", methods=["POST"])
 def paint():
-    """
-    Expects JSON with fields: filename, object_id, color (hex string).
-    Returns the modified image with the specified object painted in the given color.
-    """
     data = request.get_json(force=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
-
     fname = data.get("filename")
     obj_id = data.get("object_id")
-    color = data.get("color")
-    if fname is None or obj_id is None or color is None:
-        return jsonify({"error": "missing fields"}), 400
+    color_hex = data.get("color", "#FF0000")
 
     masks = app.config.get("masks", {}).get(fname)
-    if masks is None:
-        return jsonify({"error": "unknown filename"}), 404
+    if not masks or obj_id >= len(masks):
+        return jsonify({"error": "Unknown object or filename"}), 400
 
-    try:
-        mask = masks[int(obj_id)]
-    except (IndexError, ValueError):
-        return jsonify({"error": "invalid object_id"}), 400
-
-    try:
-        img = Image.open(os.path.join("uploads", fname)).convert("RGB")
-    except FileNotFoundError:
-        return jsonify({"error": "original image not found"}), 404
-
+    img = Image.open(os.path.join("uploads", fname)).convert("RGB")
     np_img = np.array(img)
+    mask = masks[int(obj_id)]
 
-    color = color.lstrip("#")
-    if len(color) != 6:
-        return jsonify({"error": "invalid color"}), 400
-    rgb = tuple(int(color[i:i+2], 16) for i in (0, 2, 4))
-
+    # Convert hex to RGB
+    rgb = tuple(int(color_hex.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
     np_img[mask] = rgb
 
     out = Image.fromarray(np_img)
-    out_fname = f"modified_{fname}"
-    out.save(os.path.join("uploads", out_fname))
-
     return send_file(io.BytesIO(image_to_bytes(out)), mimetype="image/png")
 
-
-# Run the server
 if __name__ == "__main__":
-    os.makedirs("uploads", exist_ok=True)
     app.run(port=5100, debug=True)
