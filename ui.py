@@ -2,7 +2,8 @@ import streamlit as st
 import requests
 from PIL import Image, ImageDraw
 import io
-from streamlit_image_coordinates import streamlit_image_coordinates
+import base64
+
 
 API_URL = "http://localhost:5100"
 
@@ -34,6 +35,9 @@ if "objects_list" not in st.session_state:
 if "last_uploaded" not in st.session_state:
     st.session_state.last_uploaded = None
 
+if "painted_image" not in st.session_state:
+    st.session_state.painted_image = None
+
 # Support jpg and png
 uploaded = st.file_uploader("Upload Image", type=["jpg", "png"])
 
@@ -42,10 +46,16 @@ if uploaded and uploaded.name != st.session_state.last_uploaded:
     st.session_state.objects_list = []
     st.session_state.selected_id = 0
     st.session_state.last_uploaded = uploaded.name
+    st.session_state.painted_image = None
 
 if uploaded:
     file_bytes = uploaded.getvalue()
-    orig = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    
+    # Use the painted image as base if it exists
+    if st.session_state.painted_image:
+        orig = Image.open(io.BytesIO(st.session_state.painted_image)).convert("RGB")
+    else:
+        orig = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     
     # Upload to backend only once per image
     if not st.session_state.objects_list:
@@ -109,6 +119,7 @@ if uploaded:
         if st.button("Apply Paint", use_container_width=True):
             payload = {
                 "filename": uploaded.name,
+                "current_image": base64.b64encode(st.session_state.painted_image if st.session_state.painted_image else file_bytes).decode('utf-8'),
                 "object_id": st.session_state.selected_id,
                 "color": color
             }
@@ -116,15 +127,30 @@ if uploaded:
                 r_paint = requests.post(f"{API_URL}/paint", json=payload)
                 if r_paint.ok:
                     res_bytes = r_paint.content
-                    st.image(io.BytesIO(res_bytes), caption="Painted Result", use_container_width=True)
-                    
-                    # Download Button
-                    st.download_button(
-                        label="Download Image",
-                        data=res_bytes,
-                        file_name=f"enhanced_{uploaded.name}",
-                        mime="image/png",
-                        use_container_width=True
-                    )
+                    st.session_state.painted_image = res_bytes
+                    st.toast(f"Object {st.session_state.selected_id} painted! You can now select another object above.", icon="🎨")
+                    st.rerun()  # Rerun to update Preview with new background
                 else:
                     st.error(f"Paint request failed: {r_paint.text}")
+
+    # --- SECTION 3: RESULT & ACTIONS ---
+    if st.session_state.painted_image:
+        st.divider()
+        st.subheader("3. Result & Actions")
+        st.info("💡 **Tip**: To add more colors, just go back to **Section 2**, pick a different object from the list, and click Apply again.")
+        st.image(io.BytesIO(st.session_state.painted_image), caption="Current Result (All paints applied)", use_container_width=True)
+        
+        col_down, col_clear = st.columns([1, 1])
+        with col_down:
+            # Download Button
+            st.download_button(
+                label="Download Image",
+                data=st.session_state.painted_image,
+                file_name=f"enhanced_{uploaded.name}",
+                mime="image/png",
+                use_container_width=True
+            )
+        with col_clear:
+            if st.button("Clear All Paints", use_container_width=True):
+                st.session_state.painted_image = None
+                st.rerun()

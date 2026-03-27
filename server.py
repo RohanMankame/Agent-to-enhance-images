@@ -39,8 +39,13 @@ print("Loading SAM 2...")
 sam2_model = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device=DEVICE)
 predictor = SAM2ImagePredictor(sam2_model)
 
+
+
+
+
+
 def get_dynamic_labels(image_path):
-    """Stage 1: Ask GPT-4o-mini for object names."""
+    """ Get object names from GPT4o-mini vision. Returns a comma-separated string of nouns. """
     with open(image_path, "rb") as f:
         encoded = base64.b64encode(f.read()).decode('utf-8')
 
@@ -49,7 +54,7 @@ def get_dynamic_labels(image_path):
         messages=[{
             "role": "user",
             "content": [
-                {"type": "text", "text": "List every distinct object in this image as a simple comma-separated string of nouns. No descriptions, just nouns."},
+                {"type": "text", "text": "List every distinct object in this image as a simple comma-separated string of nouns. No descriptions, just nouns. If there are multiple of the same type of object keep listing the object as many times as it appears in the image. make sure view the entire image before responding."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}}
             ]
         }],
@@ -57,11 +62,24 @@ def get_dynamic_labels(image_path):
     )
     return response.choices[0].message.content
 
+
+
+
+
+
 def image_to_bytes(img: Image.Image) -> bytes:
+    """
+    convert PIL Image to bytes.
+    """
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf.read()
+
+
+
+
+
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -120,16 +138,32 @@ def upload():
     app.config.setdefault("masks", {})[fname] = session_masks
     return jsonify({"objects": objects})
 
+
+
+
+
 @app.route("/paint", methods=["POST"])
 def paint():
+    """
+    Expects JSON with: filename, object_id, color (hex string), current_image (base64).
+    paints the specified object with the given color and returns the modified image.
+    """
     data = request.get_json(force=True)
-    fname, obj_id, color_hex = data.get("filename"), int(data.get("object_id")), data.get("color")
+    fname = data.get("filename")
+    obj_id = int(data.get("object_id"))
+    color_hex = data.get("color")
+    current_image_b64 = data.get("current_image")
 
     masks = app.config.get("masks", {}).get(fname)
     if not masks or obj_id >= len(masks):
         return jsonify({"error": f"Object {obj_id} not found in cache for {fname}"}), 404
 
-    img = Image.open(os.path.join("uploads", fname)).convert("RGB")
+    # Use current_image from frontend if provided, otherwise fallback to disk
+    if current_image_b64:
+        img = Image.open(io.BytesIO(base64.b64decode(current_image_b64))).convert("RGB")
+    else:
+        img = Image.open(os.path.join("uploads", fname)).convert("RGB")
+        
     np_img = np.array(img)
     mask = masks[obj_id]
 
@@ -140,5 +174,4 @@ def paint():
     return send_file(io.BytesIO(image_to_bytes(out)), mimetype="image/png")
 
 if __name__ == "__main__":
-    # Host 0.0.0.0 allows ngrok to tunnel to this port from the outside
-    app.run(host="0.0.0.0", port=5100, debug=True)
+    app.run(port=5100, debug=True)
