@@ -2,71 +2,155 @@ import streamlit as st
 import requests
 from PIL import Image, ImageDraw
 import io
+import base64
+
 
 API_URL = "http://localhost:5100"
 
-st.title("Image Object Detecition tool")
+st.set_page_config(page_title="Click-to-Paint AI", layout="wide")
 
-uploaded = st.file_uploader("Choose an image", type=["jpg", "png"])
+# Custom CSS to limit image height to 50% of the viewport height
+st.markdown(
+    """
+    <style>
+    [data-testid="stImage"] img {
+        max-height: 50vh;
+        width: auto !important;
+        object-fit: contain;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.title("AI enhance images")
+
+# Initialize Session States
+if "selected_id" not in st.session_state:
+    st.session_state.selected_id = 0
+
+if "objects_list" not in st.session_state:
+    st.session_state.objects_list = []
+
+if "last_uploaded" not in st.session_state:
+    st.session_state.last_uploaded = None
+
+if "painted_image" not in st.session_state:
+    st.session_state.painted_image = None
+
+# Support jpg and png
+uploaded = st.file_uploader("Upload Image", type=["jpg", "png"])
+
+# Clear cache if a new file is uploaded
+if uploaded and uploaded.name != st.session_state.last_uploaded:
+    st.session_state.objects_list = []
+    st.session_state.selected_id = 0
+    st.session_state.last_uploaded = uploaded.name
+    st.session_state.painted_image = None
+
 if uploaded:
-    # grab the raw bytes one time
-    data = uploaded.getvalue()
-    orig = Image.open(io.BytesIO(data))
-    st.image(orig, caption="original", width=600)
-
-    # now send a fresh BytesIO built from the bytes
-    files = {"file": (uploaded.name, io.BytesIO(data), uploaded.type)}
-    r = requests.post(f"{API_URL}/upload", files=files)
-
-    st.write("upload status", r.status_code)
-    st.write("upload response", r.text)
-    if not r.ok:
-        st.error("upload request failed")
+    file_bytes = uploaded.getvalue()
+    
+    # Use the painted image as base if it exists
+    if st.session_state.painted_image:
+        orig = Image.open(io.BytesIO(st.session_state.painted_image)).convert("RGB")
     else:
-        data = r.json()
-        objects = data.get("objects", [])
-        st.write(f"{len(objects)} objects detected")
+        orig = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    
+    # Upload to backend only once per image
+    if not st.session_state.objects_list:
+        with st.spinner("Analyzing with GPT + DINO + SAM 2..."):
+            files = {"file": (uploaded.name, io.BytesIO(file_bytes), uploaded.type)}
+            r = requests.post(f"{API_URL}/upload", files=files)
+            if r.ok:
+                st.session_state.objects_list = r.json().get("objects", [])
+                st.rerun()
+            else:
+                st.error("Server analysis failed.")
 
-        # Draw all bounding boxes on a preview image so user can see their IDs
-        all_preview = orig.copy()
-        draw_all = ImageDraw.Draw(all_preview)
-        for o in objects:
-            xmin, ymin, xmax, ymax = o["bbox"]
-            obj_id = str(o["id"])
-            draw_all.rectangle([xmin, ymin, xmax, ymax], outline="blue", width=2)
-            draw_all.text((xmin, ymin), obj_id, fill="red")
+    objects = st.session_state.objects_list
+
+    # --- SECTION 1: PREVIEW ---
+    st.subheader("1. Identify Objects")
+    
+    # Prepare Preview
+    preview = orig.copy()
+    draw = ImageDraw.Draw(preview)
+    
+    for o in objects:
+        is_active = (o["id"] == st.session_state.selected_id)
+        color = "yellow" if is_active else "lime"
+        draw.rectangle(o["bbox"], outline=color, width=(4 if is_active else 1))
+        if not is_active:
+            draw.text((o["bbox"][0], o["bbox"][1]-12), f"{o['id']}", fill="lime")
+
+    # Static Preview (Interaction removed for better reliability)
+    st.image(preview, caption="Object Preview", use_container_width=True, width=None)
+
+    st.divider()
+
+    # --- SECTION 2: PAINT ---
+    st.subheader("2. Paint Selection")
+    if objects:
+        # Layout for controls
+        ctrl_col1, ctrl_col2 = st.columns([1, 1])
         
-        st.image(all_preview, caption="All detected objects (with IDs)", width=600)
+        with ctrl_col1:
+            # Sync Dropdown with Click State
+            choices = [f"{o['id']}: {o['label']}" for o in objects]
+            choice_ids = [o["id"] for o in objects]
+            
+            # Find current index for dropdown
+            try:
+                curr_idx = choice_ids.index(st.session_state.selected_id)
+            except:
+                curr_idx = 0
 
-        choices = [
-            f"object {o['id']} (area={o['area']})" for o in objects
-        ]
-        selection = st.selectbox("pick an object", choices)
+            selection = st.selectbox("Current Selection", choices, index=curr_idx)
+            # Update state immediately if dropdown changes
+            selected_id = int(selection.split(":")[0])
+            if st.session_state.selected_id != selected_id:
+                st.session_state.selected_id = selected_id
+                st.rerun()
 
-        if selection:
-            sel_id = int(selection.split()[1])
-            info = next(o for o in objects if o["id"] == sel_id)
-            xmin, ymin, xmax, ymax = info["bbox"]
+        with ctrl_col2:
+            color = st.color_picker("Pick Paint Color", "#FF0000")
 
-            preview = orig.copy()
-            draw = ImageDraw.Draw(preview)
-            draw.rectangle([xmin, ymin, xmax, ymax],
-                           outline="red", width=3)
-            st.image(preview, caption="selection preview", width=600)
-
-        color = st.color_picker("pick a colour", "#ff0000")
-        if st.button("paint"):
-            obj_id = int(selection.split()[1])
+        if st.button("Apply Paint", use_container_width=True):
             payload = {
                 "filename": uploaded.name,
-                "object_id": obj_id,
-                "color": color,
+                "current_image": base64.b64encode(st.session_state.painted_image if st.session_state.painted_image else file_bytes).decode('utf-8'),
+                "object_id": st.session_state.selected_id,
+                "color": color
             }
-            r2 = requests.post(f"{API_URL}/paint", json=payload)
-            #st.write("paint status", r2.status_code)
-            st.write("paint response", r2.text[:500])
-            if r2.ok:
-                img = Image.open(io.BytesIO(r2.content))
-                st.image(img, caption="modified", width=600)
-            else:
-                st.error("paint request failed")
+            with st.spinner("Modifying pixels..."):
+                r_paint = requests.post(f"{API_URL}/paint", json=payload)
+                if r_paint.ok:
+                    res_bytes = r_paint.content
+                    st.session_state.painted_image = res_bytes
+                    st.toast(f"Object {st.session_state.selected_id} painted! You can now select another object above.", icon="🎨")
+                    st.rerun()  # Rerun to update Preview with new background
+                else:
+                    st.error(f"Paint request failed: {r_paint.text}")
+
+    # --- SECTION 3: RESULT & ACTIONS ---
+    if st.session_state.painted_image:
+        st.divider()
+        st.subheader("3. Result & Actions")
+        st.info("💡 **Tip**: To add more colors, just go back to **Section 2**, pick a different object from the list, and click Apply again.")
+        st.image(io.BytesIO(st.session_state.painted_image), caption="Current Result (All paints applied)", use_container_width=True)
+        
+        col_down, col_clear = st.columns([1, 1])
+        with col_down:
+            # Download Button
+            st.download_button(
+                label="Download Image",
+                data=st.session_state.painted_image,
+                file_name=f"enhanced_{uploaded.name}",
+                mime="image/png",
+                use_container_width=True
+            )
+        with col_clear:
+            if st.button("Clear All Paints", use_container_width=True):
+                st.session_state.painted_image = None
+                st.rerun()
