@@ -21,6 +21,7 @@ except ImportError:
 
 app = Flask(__name__)
 
+
 # --- CONFIGURATION ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINO_MODEL_ID = "IDEA-Research/grounding-dino-base"
